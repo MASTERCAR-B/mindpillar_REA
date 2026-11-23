@@ -794,39 +794,350 @@ def _detect_single_cvd_divergences(
     return {"divergences": divs, "highPivots": hi_pivs, "lowPivots": lo_pivs}
 
 
+MINDPILLAR_DIV_PRESETS: Dict[str, Dict[str, Any]] = {
+    # Exact UI defaults from MindPillar's `Yc` (fractal) and `Jc` (zigzag)
+    "fractal": {
+        "pivot_mode": "fractal",
+        "window_size": 2,
+        "engulf_len": 50,
+        "status_filter": "confirmed",  # hides rejected; keeps pending + confirmed
+        "show_pending": True,
+        "show_confirmed": True,
+        "min_lines": 1,
+        "min_size_atr": 0.0,
+        "max_span_bars": 20,
+        "min_rr": 0.0,
+        "one_line_per_anchor": False,
+        "hide_played_out": False,
+    },
+    "zigzag": {
+        "pivot_mode": "zigzag",
+        "zigzag_atr_mult": 2.0,  # 3.0 on 3m timeframe per MindPillar `aee`
+        "zigzag_atr_period": 14,
+        "engulf_len": 50,
+        "pair_rule": "gap-else-prev",
+        "min_gap_atr": 16.0,
+        "keep_adjacent": True,
+        "status_filter": "confirmed",
+        "show_pending": True,
+        "show_confirmed": True,
+        "min_lines": 1,
+        "min_size_atr": 3.0,
+        "max_span_bars": 0,
+        "min_rr": 1.0,
+        "one_line_per_anchor": True,
+        "hide_played_out": True,
+    },
+    "raw": {
+        "pivot_mode": "fractal",
+        "window_size": 2,
+        "engulf_len": 50,
+        "status_filter": "all",
+        "show_pending": True,
+        "show_confirmed": True,
+        "min_lines": 1,
+        "min_size_atr": 0.0,
+        "max_span_bars": 0,
+        "min_rr": 0.0,
+        "one_line_per_anchor": False,
+        "hide_played_out": False,
+    },
+}
+
+
+def _sign(x: float) -> int:
+    return 1 if x > 0 else (-1 if x < 0 else 0)
+
+
+def _clamp01(x: float) -> float:
+    return 0.0 if x < 0.0 else (1.0 if x > 1.0 else x)
+
+
+def _atr14_at(candles: Sequence[Dict[str, Any]], bar_index: int, period: int = 14) -> float:
+    """Exact port of MindPillar `qC`: 14-bar SMA of True Range ending at `bar_index`."""
+    end = min(bar_index, len(candles) - 1)
+    if end < 1:
+        return 0.0
+    start = max(1, end - period + 1)
+    total = 0.0
+    cnt = 0
+    for i in range(start, end + 1):
+        c = candles[i]
+        pc = float(candles[i - 1]["close"])
+        tr = max(float(c["high"]) - float(c["low"]), abs(float(c["high"]) - pc), abs(float(c["low"]) - pc))
+        total += tr
+        cnt += 1
+    return (total / cnt) if cnt > 0 else 0.0
+
+
+def _target_price(candles: Sequence[Dict[str, Any]], div: Dict[str, Any]) -> float:
+    """Exact port of MindPillar `YC`: extreme opposite wick strictly between prev and curr."""
+    bull = div["kind"] == "bullish"
+    ext = -math.inf if bull else math.inf
+    for i in range(div["prev"]["barIndex"] + 1, div["curr"]["barIndex"]):
+        v = float(candles[i]["high"]) if bull else float(candles[i]["low"])
+        if (bull and v > ext) or (not bull and v < ext):
+            ext = v
+    return ext if math.isfinite(ext) else float(div["curr"]["price"])
+
+
+def _trade_metrics(candles: Sequence[Dict[str, Any]], div: Dict[str, Any], target: float, lock_idx: int) -> Dict[str, Any]:
+    """Exact port of MindPillar `JC`: zero-lookahead entry at lock bar close, stop at curr pivot."""
+    empty = {"entryPrice": None, "rewardPct": None, "riskPct": None, "rr": None}
+    if lock_idx < 0 or not candles:
+        return empty
+    entry = float(candles[min(lock_idx, len(candles) - 1)]["close"])
+    if entry <= 0:
+        return empty
+    bull = div["kind"] == "bullish"
+    reward = (target - entry) if bull else (entry - target)
+    risk = (entry - float(div["curr"]["price"])) if bull else (float(div["curr"]["price"]) - entry)
+    return {
+        "entryPrice": entry,
+        "rewardPct": round((reward / entry) * 100.0, 6),
+        "riskPct": round((risk / entry) * 100.0, 6),
+        "rr": round(reward / risk, 6) if (risk > 0 and reward > 0) else None,
+    }
+
+
+def _project_venues_by_bar(
+    candle_times: Sequence[int],
+    prev_piv: Dict[str, Any],
+    curr_piv: Dict[str, Any],
+    cvd_maps: Dict[str, Dict[int, float]],
+    venue_ids: Sequence[str],
+    sample_radius: int = 0,
+) -> Dict[str, Any]:
+    """Exact port of MindPillar `hk` (`Pe`): multi-venue projection with range-normalized strength."""
+    a_piv, b_piv = (prev_piv, curr_piv) if prev_piv["barIndex"] <= curr_piv["barIndex"] else (curr_piv, prev_piv)
+    price_slope = _sign(float(b_piv["price"]) - float(a_piv["price"]))
+    price_up = price_slope > 0
+    n = len(candle_times)
+    lines = []
+    div_count = 0
+    strength_sum = 0.0
+
+    for vid in venue_ids:
+        cmap = cvd_maps.get(vid)
+
+        def sample(idx: int) -> Optional[Tuple[float, int]]:
+            if not cmap:
+                return None
+            best_v: Optional[float] = None
+            best_t = 0
+            lo = max(0, idx - sample_radius)
+            hi = min(n - 1, idx + sample_radius)
+            for j in range(lo, hi + 1):
+                t = candle_times[j]
+                v = cmap.get(t)
+                if v is not None and (best_v is None or (v < best_v if price_up else v > best_v)):
+                    best_v, best_t = v, t
+            return None if best_v is None else (best_v, best_t)
+
+        s1 = sample(a_piv["barIndex"])
+        s2 = sample(b_piv["barIndex"])
+        v1 = s1[0] if s1 else None
+        v2 = s2[0] if s2 else None
+        is_div = False
+        strength = 0.0
+        if v1 is not None and v2 is not None:
+            cvd_slope = _sign(v2 - v1)
+            is_div = price_slope != 0 and cvd_slope != 0 and price_slope != cvd_slope
+            if is_div and cmap:
+                mn, mx = math.inf, -math.inf
+                for j in range(a_piv["barIndex"], b_piv["barIndex"] + 1):
+                    val = cmap.get(candle_times[j])
+                    if val is not None:
+                        if val < mn:
+                            mn = val
+                        if val > mx:
+                            mx = val
+                span = mx - mn
+                strength = _clamp01(abs(v2 - v1) / span) if (math.isfinite(span) and span > 0) else 0.0
+                div_count += 1
+                strength_sum += strength
+
+        lines.append(
+            {
+                "id": vid,
+                "cvd1": v1,
+                "cvd2": v2,
+                "tMs1": s1[1] if s1 else None,
+                "tMs2": s2[1] if s2 else None,
+                "delta": None if (v1 is None or v2 is None) else (v2 - v1),
+                "diverging": is_div,
+                "strength": round(strength, 6),
+            }
+        )
+
+    return {
+        "a": {"tMs": a_piv["timeMs"], "price": a_piv["price"]},
+        "b": {"tMs": b_piv["timeMs"], "price": b_piv["price"]},
+        "priceSlope": price_slope,
+        "lines": lines,
+        "divergingCount": div_count,
+        "total": len(lines),
+        "strengthAvg": round(strength_sum / div_count, 6) if div_count > 0 else 0.0,
+    }
+
+
+def project_divergence(
+    cvd_by_venue: Dict[str, List[Dict[str, Any]]],
+    t1_ms: int,
+    price1: float,
+    t2_ms: int,
+    price2: float,
+    window_ms: int = 0,
+) -> Dict[str, Any]:
+    """Exact port of MindPillar's manual Measure-Divergence tool (`_k` / `pk` / `mk`).
+
+    Projects any two user-chosen price/time points onto all venue CVD lines and reports
+    per-venue agreement, `divergingCount`/`total`, and range-normalized `strengthAvg`.
+    Detects BOTH absorption (LH/HH, HL/LL) and classic (HH/LH, LL/HL) divergences.
+    """
+    a, b = ({"tMs": int(t1_ms), "price": float(price1)}, {"tMs": int(t2_ms), "price": float(price2)})
+    if a["tMs"] > b["tMs"]:
+        a, b = b, a
+    price_slope = _sign(b["price"] - a["price"])
+    price_up = price_slope > 0
+
+    def sample_series(ser: Sequence[Dict[str, Any]], target_ms: int) -> Tuple[Optional[float], int]:
+        if not ser:
+            return None, -1
+        # Floor binary search (`lk`)
+        lo, hi, floor_i = 0, len(ser) - 1, -1
+        while lo <= hi:
+            mid = (lo + hi) >> 1
+            if int(ser[mid]["time"]) <= target_ms:
+                floor_i = mid
+                lo = mid + 1
+            else:
+                hi = mid - 1
+        if window_ms <= 0:
+            return (float(ser[floor_i]["value"]), floor_i) if floor_i >= 0 else (None, -1)
+        # Window scan [target_ms - window_ms .. target_ms + window_ms]
+        idxs = [i for i, pt in enumerate(ser) if target_ms - window_ms <= int(pt["time"]) <= target_ms + window_ms]
+        if not idxs:
+            return (float(ser[floor_i]["value"]), floor_i) if floor_i >= 0 else (None, -1)
+        best_i = idxs[0]
+        best_v = float(ser[best_i]["value"])
+        for i in idxs[1:]:
+            v = float(ser[i]["value"])
+            if (price_up and v < best_v) or (not price_up and v > best_v):
+                best_v, best_i = v, i
+        return best_v, best_i
+
+    lines = []
+    div_count = 0
+    strength_sum = 0.0
+    for vid, ser in cvd_by_venue.items():
+        v1, i1 = sample_series(ser, a["tMs"])
+        v2, i2 = sample_series(ser, b["tMs"])
+        is_div = False
+        strength = 0.0
+        if v1 is not None and v2 is not None:
+            cvd_slope = _sign(v2 - v1)
+            is_div = price_slope != 0 and cvd_slope != 0 and price_slope != cvd_slope
+            if is_div and i1 >= 0 and i2 >= 0:
+                lo_i, hi_i = min(i1, i2), max(i1, i2)
+                vals = [float(ser[j]["value"]) for j in range(lo_i, hi_i + 1)]
+                span = max(vals) - min(vals)
+                strength = _clamp01(abs(v2 - v1) / span) if span > 0 else 0.0
+                div_count += 1
+                strength_sum += strength
+        lines.append(
+            {
+                "id": vid,
+                "cvd1": v1,
+                "cvd2": v2,
+                "tMs1": int(ser[i1]["time"]) if (v1 is not None and i1 >= 0) else None,
+                "tMs2": int(ser[i2]["time"]) if (v2 is not None and i2 >= 0) else None,
+                "delta": None if (v1 is None or v2 is None) else (v2 - v1),
+                "diverging": is_div,
+                "strength": round(strength, 6),
+            }
+        )
+
+    return {
+        "a": a,
+        "b": b,
+        "priceSlope": price_slope,
+        "lines": lines,
+        "divergingCount": div_count,
+        "total": len(lines),
+        "strengthAvg": round(strength_sum / div_count, 6) if div_count > 0 else 0.0,
+    }
+
+
 def detect_divergences(
     candles: Sequence[Dict[str, Any]],
     cvd_by_venue: Dict[str, List[Dict[str, Any]]],
     *,
-    pivot_mode: str = "fractal",
-    window_size: int = 2,
-    engulf_len: int = 50,
-    zigzag_atr_mult: float = 2.0,
+    preset: Optional[str] = None,
+    tf_ms: Optional[int] = None,
+    pivot_mode: Optional[str] = None,
+    window_size: Optional[int] = None,
+    engulf_len: Optional[int] = None,
+    zigzag_atr_mult: Optional[float] = None,
     zigzag_atr_period: int = 14,
-    pair_rule: str = "depth",
-    min_gap_atr: float = 16.0,
-    keep_adjacent: bool = True,
+    pair_rule: Optional[str] = None,
+    min_gap_atr: Optional[float] = None,
+    keep_adjacent: Optional[bool] = None,
     remove_inner_divs: bool = True,
-    min_lines: int = 1,
-    status_filter: str = "all",
+    status_filter: Optional[str] = None,
+    show_pending: Optional[bool] = None,
+    show_confirmed: Optional[bool] = None,
+    min_lines: Optional[int] = None,
+    min_size_atr: Optional[float] = None,
+    max_span_bars: Optional[int] = None,
+    min_rr: Optional[float] = None,
+    one_line_per_anchor: Optional[bool] = None,
+    hide_played_out: Optional[bool] = None,
 ) -> Dict[str, Any]:
-    """Detect multi-venue CVD divergences matching MindPillar's `Iee` + k/n venue projection."""
+    """Exact port of MindPillar's full CVD divergence pipeline (`Iee` + `XC` + `Xc`/`Zc`/`Qc`/`tl`).
+
+    Presets:
+      - `preset="fractal"` -> MindPillar default Fractal chart preset (`Yc`: maxSpanBars=20, hides rejected)
+      - `preset="zigzag"`  -> MindPillar default Swing/ATR chart preset (`Jc`: minSizeAtr=3, minRr=1, oneLinePerAnchor, hidePlayedOut)
+      - `preset="raw"` (or `None`) -> returns all detected divergences with full MindPillar enrichment fields
+    """
+    base = MINDPILLAR_DIV_PRESETS.get(preset or "raw", MINDPILLAR_DIV_PRESETS["raw"])
+    p_mode = pivot_mode if pivot_mode is not None else base.get("pivot_mode", "fractal")
+    w_size = window_size if window_size is not None else base.get("window_size", 2)
+    e_len = engulf_len if engulf_len is not None else base.get("engulf_len", 50)
+    # MindPillar `aee`: 3m timeframe defaults zigzag reversal to 3*ATR, all others 2*ATR
+    default_zz_mult = 3.0 if tf_ms == 180_000 else base.get("zigzag_atr_mult", 2.0)
+    zz_mult = zigzag_atr_mult if zigzag_atr_mult is not None else default_zz_mult
+    p_rule = pair_rule if pair_rule is not None else ("gap-else-prev" if p_mode == "zigzag" else "depth")
+    m_gap = min_gap_atr if min_gap_atr is not None else base.get("min_gap_atr", 16.0)
+    k_adj = keep_adjacent if keep_adjacent is not None else base.get("keep_adjacent", True)
+
+    f_status = status_filter if status_filter is not None else base.get("status_filter", "all")
+    f_show_pending = show_pending if show_pending is not None else base.get("show_pending", True)
+    f_show_confirmed = show_confirmed if show_confirmed is not None else base.get("show_confirmed", True)
+    f_min_lines = min_lines if min_lines is not None else base.get("min_lines", 1)
+    f_min_size_atr = min_size_atr if min_size_atr is not None else base.get("min_size_atr", 0.0)
+    f_max_span = max_span_bars if max_span_bars is not None else base.get("max_span_bars", 0)
+    f_min_rr = min_rr if min_rr is not None else base.get("min_rr", 0.0)
+    f_one_per_anchor = one_line_per_anchor if one_line_per_anchor is not None else base.get("one_line_per_anchor", False)
+    f_hide_played_out = hide_played_out if hide_played_out is not None else base.get("hide_played_out", False)
+
     cfg = {
-        "windowSize": window_size,
+        "windowSize": w_size,
         "minDistance": 0,
-        "engulfLen": engulf_len,
+        "engulfLen": e_len,
         "lastPivotCount": 2000,
         "removeInnerDivs": False,
         "scanLen": 1000,
         "cvdSampling": "pivot",
         "sfpReclaimLen": 50,
         "lineCrossTolerance": 0.5,
-        "pivotMode": pivot_mode,
-        "zigzagAtrMult": zigzag_atr_mult,
+        "pivotMode": p_mode,
+        "zigzagAtrMult": zz_mult,
         "zigzagAtrPeriod": zigzag_atr_period,
-        "pairRule": pair_rule,
-        "minGapAtr": min_gap_atr,
-        "keepAdjacent": keep_adjacent,
+        "pairRule": p_rule,
+        "minGapAtr": m_gap,
+        "keepAdjacent": k_adj,
     }
     venue_ids = list(cvd_by_venue.keys())
     if not candles or not venue_ids:
@@ -836,6 +1147,7 @@ def detect_divergences(
     hi_pivs: List[Dict[str, Any]] = []
     lo_pivs: List[Dict[str, Any]] = []
 
+    candle_times = [int(c["time"]) for c in candles]
     cvd_lookup: Dict[str, Dict[int, float]] = {
         vid: {int(pt["time"]): float(pt["value"]) for pt in ser}
         for vid, ser in cvd_by_venue.items()
@@ -853,55 +1165,141 @@ def detect_divergences(
 
     divs = list(merged.values())
     if remove_inner_divs:
-        divs = _remove_inner_divs(divs, window_size)
+        divs = _remove_inner_divs(divs, w_size)
 
-    # Re-normalize strength + compute per-venue k/n projection
+    # Global strength normalization (`Nc`)
     max_cvd = max((abs(d["cvdDelta"]) for d in divs), default=0.0)
     max_px = max((abs(d["priceDeltaPct"]) for d in divs), default=0.0)
-    atr_arr = _calc_atr(candles, 14)
 
-    enriched: List[Dict[str, Any]] = []
+    # Full MindPillar enrichment (`XC`: targetPrice, invalidationPrice, structurePct, structureAtr, entryPrice, rewardPct, riskPct, rr, lockIndex, projection)
+    sample_radius = 0 if cfg["cvdSampling"] == "pivot" else w_size
+    enriched_all: List[Dict[str, Any]] = []
     for d in divs:
         sc = abs(d["cvdDelta"]) / max_cvd if max_cvd > 0 else 0.0
         sp = abs(d["priceDeltaPct"]) / max_px if max_px > 0 else 0.0
         d["strength"] = round(0.6 * sc + 0.4 * sp, 6)
 
-        t1, t2 = d["prev"]["timeMs"], d["curr"]["timeMs"]
-        bears = d["kind"] == "bearish"
-        lines = []
-        div_count = 0
-        for vid in venue_ids:
-            v1 = cvd_lookup[vid].get(t1)
-            v2 = cvd_lookup[vid].get(t2)
-            is_div = False
-            if v1 is not None and v2 is not None:
-                is_div = (v2 > v1) if bears else (v2 < v1)
-            if is_div:
-                div_count += 1
-            lines.append({"id": vid, "cvd1": v1, "cvd2": v2, "delta": (None if v1 is None or v2 is None else v2 - v1), "diverging": is_div})
-        d["projection"] = {"divergingCount": div_count, "total": len(venue_ids), "lines": lines}
+        target = _target_price(candles, d)
+        struct_dist = abs(target - float(d["curr"]["price"]))
+        atr_here = _atr14_at(candles, d["curr"]["barIndex"], 14)
+        base_lock = d["curr"].get("lockBarIndex", d["curr"]["barIndex"] + w_size)
+        lock_idx = max(len(candles), base_lock) if d["curr"].get("pending") else base_lock
+        tm = _trade_metrics(candles, d, target, lock_idx)
+        proj = _project_venues_by_bar(candle_times, d["prev"], d["curr"], cvd_lookup, venue_ids, sample_radius)
 
-        # Structure size in ATR & Reward/Risk to reference level
-        ci = d["curr"]["barIndex"]
-        ref = d.get("referenceLevel")
-        atr_here = atr_arr[ci] if ci < len(atr_arr) else 0.0
-        if ref is not None and atr_here > 0:
-            struct_dist = abs(d["curr"]["price"] - ref)
-            risk_dist = abs(d["prev"]["price"] - d["curr"]["price"])
-            d["structureAtr"] = round(struct_dist / atr_here, 4)
-            d["rr"] = round(struct_dist / risk_dist, 4) if risk_dist > 0 else None
+        # Lifecycle state (`iw`): confirmed | rejected | forming | armed
+        if d["status"] == "confirmed":
+            state = "confirmed"
+        elif d["status"] == "rejected":
+            state = "rejected"
+        elif d["curr"].get("pending") or d["prev"].get("pending"):
+            state = "forming"
         else:
-            d["structureAtr"] = 0.0
-            d["rr"] = None
+            state = "armed"
 
-        if div_count < min_lines:
-            continue
-        if status_filter != "all" and d["status"] != status_filter:
-            continue
-        enriched.append(d)
+        d["key"] = f"{d['kind']}|{d['prev']['timeMs']}|{d['curr']['timeMs']}"
+        d["state"] = state
+        d["projection"] = proj
+        d["targetPrice"] = target
+        d["invalidationPrice"] = float(d["prev"]["price"])
+        d["structurePct"] = round(0.0 if d["curr"]["price"] == 0 else (struct_dist / d["curr"]["price"]) * 100.0, 6)
+        d["structureAtr"] = round(struct_dist / atr_here, 4) if atr_here > 0 else 0.0
+        d["entryPrice"] = tm["entryPrice"]
+        d["rewardPct"] = tm["rewardPct"]
+        d["riskPct"] = tm["riskPct"]
+        d["rr"] = tm["rr"]
+        d["lockIndex"] = lock_idx
+        d["armedTimeMs"] = candle_times[base_lock] if base_lock < len(candle_times) else None
+        d["anchorConfirms"] = []
+        enriched_all.append(d)
 
-    enriched.sort(key=lambda x: x["curr"]["timeMs"], reverse=True)
-    return {"divergences": enriched, "highPivots": hi_pivs, "lowPivots": lo_pivs}
+    # Build `anchorConfirms` index (`XC`) for `hidePlayedOut` (`Qc`)
+    confirms_by_anchor: Dict[str, List[Dict[str, Any]]] = {}
+    for d in enriched_all:
+        if d["status"] != "confirmed" or d["barsToResolve"] is None or d["prev"].get("pending"):
+            continue
+        akey = f"{d['kind']}|{d['prev']['timeMs']}"
+        confirms_by_anchor.setdefault(akey, []).append(
+            {
+                "key": d["key"],
+                "resolvedIndex": d["curr"]["barIndex"] + d["barsToResolve"],
+                "projection": d["projection"],
+                "structureAtr": d["structureAtr"],
+                "barSpan": d["barSpan"],
+                "rr": d["rr"],
+            }
+        )
+    for arr in confirms_by_anchor.values():
+        arr.sort(key=lambda x: x["resolvedIndex"])
+    for d in enriched_all:
+        if not d["prev"].get("pending"):
+            akey = f"{d['kind']}|{d['prev']['timeMs']}"
+            if akey in confirms_by_anchor:
+                d["anchorConfirms"] = confirms_by_anchor[akey]
+
+    def passes_quality(item: Dict[str, Any]) -> bool:
+        """Exact port of MindPillar `Zc`."""
+        proj = item.get("projection")
+        if proj:
+            req_lines = min(f_min_lines, proj["total"])
+            if req_lines > 1 and proj["divergingCount"] < req_lines:
+                return False
+        if f_min_size_atr > 0 and item["structureAtr"] > 0 and item["structureAtr"] < f_min_size_atr:
+            return False
+        if f_max_span > 0 and item["barSpan"] > f_max_span:
+            return False
+        if f_min_rr > 0 and item["rr"] is not None and item["rr"] < f_min_rr:
+            return False
+        return True
+
+    def is_played_out(item: Dict[str, Any]) -> bool:
+        """Exact port of MindPillar `Qc`."""
+        if item["prev"].get("pending") or not item["anchorConfirms"]:
+            return False
+        for c in item["anchorConfirms"]:
+            if c["key"] == item["key"] or not passes_quality(c):
+                continue
+            return item["lockIndex"] >= c["resolvedIndex"]
+        return False
+
+    # Apply MindPillar filter predicate `Xc`
+    filtered: List[Dict[str, Any]] = []
+    for d in enriched_all:
+        if d["status"] == "rejected" and f_status != "all":
+            continue
+        if d["status"] == "pending" and not f_show_pending:
+            continue
+        if d["status"] == "confirmed" and not f_show_confirmed:
+            continue
+        if f_status in ("pending", "rejected") and d["status"] != f_status:
+            continue
+        if not passes_quality(d):
+            continue
+        if f_hide_played_out and is_played_out(d):
+            continue
+        filtered.append(d)
+
+    # `oneLinePerAnchor` (`tl`): keep only latest curr bar per anchor (prefer pending on tie)
+    if f_one_per_anchor:
+        by_anchor: Dict[str, Dict[str, Any]] = {}
+        for d in filtered:
+            akey = f"{d['kind']}|{d['prev']['timeMs']}"
+            ex = by_anchor.get(akey)
+            if (
+                ex is None
+                or d["curr"]["barIndex"] > ex["curr"]["barIndex"]
+                or (d["curr"]["barIndex"] == ex["curr"]["barIndex"] and d["curr"].get("pending") and not ex["curr"].get("pending"))
+            ):
+                by_anchor[akey] = d
+        keep_keys = {v["key"] for v in by_anchor.values()}
+        filtered = [d for d in filtered if d["key"] in keep_keys]
+
+    # Strip internal anchorConfirms list length bloat to summary count
+    for d in filtered:
+        d["anchorConfirmCount"] = len(d.pop("anchorConfirms", []))
+
+    filtered.sort(key=lambda x: x["curr"]["timeMs"], reverse=True)
+    return {"divergences": filtered, "highPivots": hi_pivs, "lowPivots": lo_pivs}
 
 
 # ---------------------------------------------------------------------------
@@ -1278,7 +1676,13 @@ class MindPillarClient:
             }
         if include_divergences and primary_candles:
             perp_cvd_map = {m.id: cvd_by_id[m.id] for m in perp_list if m.id in cvd_by_id}
-            out["divergences"] = detect_divergences(primary_candles, perp_cvd_map, pivot_mode=divergence_mode)
+            out["divergences"] = detect_divergences(
+                primary_candles,
+                perp_cvd_map,
+                preset=divergence_mode if divergence_mode in MINDPILLAR_DIV_PRESETS else "raw",
+                tf_ms=tf_ms,
+                pivot_mode=divergence_mode if divergence_mode in ("fractal", "zigzag") else "fractal",
+            )
         return out
 
     # ---- Open Interest ----

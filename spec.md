@@ -104,7 +104,28 @@ From `use-wake-catchup-DVsv7BE7.js` (`Yk`, `Xk`, `Zk`, `$k`, `eA`):
   - `daily` (`CVD 1D`): running sum resetting to `0` at `00:00 UTC`.
   - `rolling` (`CVD 24H`): `prefix[i] - prefix[len - 1 - rolling_bars]`.
 - Aggregate CVD: sums bar deltas across all selected markets aligned by `time`, then applies `compute_cvd_series`.
-- Divergences (`chart-page-boundary-C1k_BLj_.js`, `Mc`/`Iee`/`Ac`/`kc`): fractal (`windowSize=2`) or ATR zigzag (`zigzagAtrPeriod=14`, `zigzagAtrMult=2.0`) pivots compared wick-to-wick against each venue's CVD, scored with `k/n` multi-venue projection, `confirmed`/`rejected`/`pending` resolution, MFE/MAE %, and SFP reclaim targets (`0.618`, `0.786`).
+- **Exact MindPillar CVD Divergence Formula** (`chart-page-boundary-C1k_BLj_.js` `Mc`/`Iee`/`Ac`/`kc`/`XC`/`JC`/`YC`/`qC`/`Xc`/`Zc`/`Qc`/`tl` + `use-wake-catchup-DVsv7BE7.js` `hk`/`_k`):
+  1. **Pivots (wick-only)**:
+     - **Fractal (`windowSize=2`)**: High pivot `high[i] > max(high[i-w..i-1])` & `> max(high[i+1..i+w])`; Low pivot `low[i] < min(low[i-w..i-1])` & `< min(low[i+1..i+w])` (with `minDistance+1` on lows). Appends a live `pending` tail extreme if the right tail has no settled pivot. `lockIndex = barIndex + windowSize`.
+     - **Swing / ATR ZigZag (`zigzagAtrPeriod=14`, `zigzagAtrMult=2.0`, or `3.0` on `3m`)**: Reversal triggers when `hi - low[i] >= mult * ATR14[i]` (locks high pivot at `lockBarIndex = i`) or `high[i] - lo >= mult * ATR14[i]` (locks low pivot).
+  2. **Core Absorption Divergence Rule (`jc`)**:
+     - **Bearish**: Price makes a **Lower High** (`curr.high < prev.high`) while CVD makes a **Higher High** (`curr.cvd > prev.cvd`).
+     - **Bullish**: Price makes a **Higher Low** (`curr.low > prev.low`) while CVD makes a **Lower Low** (`curr.cvd < prev.cvd`).
+     - Scanned back up to `engulfLen = 50` pivots with monotonic envelope occlusion + straight-line non-crossing tolerance `0.5 * mean(high - low over [prev..curr])`. ZigZag uses `pairRule="gap-else-prev"` (`minGapAtr = 16`, `keepAdjacent = true`).
+     - *(Manual 2-point measure tool `_k` / `project_divergence` detects any opposite price vs CVD slope: `sign(Δprice) != sign(Δcvd)`.)*
+  3. **Multi-Venue Fusion & Inner Suppression (`Iee`, `Pc`)**: Runs on every venue CVD independently, merges by `kind|prev.timeMs|curr.timeMs` (max `|cvdDelta|`), drops inner pairs nested inside an unresolved outer divergence.
+  4. **Zero-Lookahead Entry, Target, Invalidation & R:R (`YC`, `JC`, `qC`, `Ac`)**:
+     - `targetPrice`: extreme opposite wick strictly between `prev` and `curr` (`max(high)` for bullish, `min(low)` for bearish).
+     - `invalidationPrice`: `prev.price`.
+     - `entryPrice`: `candles[min(lockIndex, N-1)].close` (close of the confirmation/lock bar, zero lookahead).
+     - `reward = |targetPrice - entryPrice|` (signed), `risk = |entryPrice - curr.price|` (stop at `curr` wick), `rr = reward / risk` if both `> 0`.
+     - `structureAtr = |targetPrice - curr.price| / ATR14(curr.barIndex)`.
+     - Causal resolution starts at `max(curr.barIndex, lockBarIndex) + 1`: `confirmed` if `targetPrice` hits first, `rejected` if `prev.price` breaks first, else `forming` (if pending) or `armed`.
+  5. **Per-Venue `k/n` Projection & Strength (`hk`)**: For each venue `v`, `strength_v = clamp01(|cvd2 - cvd1| / (max_cvd[prev..curr] - min_cvd[prev..curr]))`, reported as `divergingCount / total` and `strengthAvg`.
+  6. **Failed-Divergence SFP Reclaim (`kc`)**: On `rejected` divergences, scans up to `sfpReclaimLen = 50` bars for a close reclaiming back inside `prev.price`, then projects `0.618` and `0.786` Fib targets from `sfpExtreme` to `structureExtreme`.
+  7. **Chart Filter Presets (`Yc` / `Jc`)**:
+     - `fractal`: `maxSpanBars=20`, hides rejected (`statusFilter="confirmed"`), `showPending=True`.
+     - `zigzag`: `minSizeAtr=3`, `minRr=1`, `oneLinePerAnchor=True`, `hidePlayedOut=True` (suppresses new pairs on an anchor once an earlier qualifying divergence from that anchor already confirmed before `lockIndex`).
 
 ---
 
