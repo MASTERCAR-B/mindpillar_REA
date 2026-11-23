@@ -89,5 +89,47 @@ Endpoints (interactive docs at `http://127.0.0.1:8765/docs`):
 python selftest_live.py
 ```
 
+## Exact MindPillar CVD Divergence Formula
+
+`mp.detect_divergences()` and `mp.project_divergence()` implement MindPillar's exact client-side divergence engine:
+
+1. **Absorption Rule (wick-to-wick)**:
+   - **Bearish**: Price Lower High (`curr.high < prev.high`) + CVD Higher High (`curr.cvd > prev.cvd`).
+   - **Bullish**: Price Higher Low (`curr.low > prev.low`) + CVD Lower Low (`curr.cvd < prev.cvd`).
+2. **Pivot Modes**:
+   - `preset="fractal"`: ±2-bar wick fractals (`windowSize=2`), `maxSpanBars=20`, plus live `forming` tail pivot.
+   - `preset="zigzag"`: 14-bar ATR ZigZag (`2.0 * ATR`, `3.0 * ATR` on `3m`), `gap-else-prev` pairing (`minGapAtr=16`), filtered by `minSizeAtr >= 3.0`, `minRr >= 1.0`, `oneLinePerAnchor=True`, and `hidePlayedOut=True`.
+   - `preset="raw"`: Unfiltered output with all enrichment fields.
+3. **Structural Guards**: Up to 50 prior pivots (`engulfLen`), monotonic envelope occlusion, straight-line crossing tolerance (`0.5 * avg_range`), and inner-divergence suppression.
+4. **Zero-Lookahead Entry & R:R**:
+   - `entryPrice`: close of the lock/confirmation bar (`lockIndex`).
+   - `targetPrice`: extreme opposite wick strictly between `prev` and `curr`.
+   - `invalidationPrice`: `prev.price`; stop distance measured from `entryPrice` to `curr.price`.
+   - Lifecycle `state`: `forming` → `armed` → `confirmed` or `rejected`.
+5. **Multi-Venue `k/n` Projection & SFP Reclaim**:
+   - Scores every venue with range-normalized strength `|Δcvd| / (max_cvd - min_cvd)` across `[prev..curr]` (`divergingCount / total`, `strengthAvg`).
+   - On `rejected` divergences, scans 50 bars for a close reclaiming `prev.price` and computes `0.618` / `0.786` SFP Fib targets.
+
+```python
+import mp
+
+c = mp.MindPillarClient()
+snap = c.cvd_snapshot("btc", tf="15m", bars=1000, include_series=True)
+candles = snap["series"]["candles"]["binance-btc"]
+cvd = snap["series"]["cvd"]
+
+# High-signal Swing/ZigZag preset (minSizeAtr>=3, minRr>=1, hidePlayedOut):
+zz = mp.detect_divergences(candles, cvd, preset="zigzag", tf_ms=snap["tf_ms"])
+
+# Fractal preset requiring >= 3/4 venues agreeing:
+fr = mp.detect_divergences(candles, cvd, preset="fractal", min_lines=3, tf_ms=snap["tf_ms"])
+
+# Manual 2-point measure-divergence projection:
+proj = mp.project_divergence(cvd, t1_ms=candles[-30]["time"], price1=candles[-30]["low"],
+                             t2_ms=candles[-5]["time"], price2=candles[-5]["low"])
+```
+
+HTTP equivalent: `GET http://127.0.0.1:8765/v1/divergences?asset=btc&tf=15m&preset=zigzag&min_lines=3`
+
 ## Documentation
 See [`spec.md`](spec.md) for the full reverse-engineered protocol, endpoint table, WebSocket framing, CVD/divergence formulas, and known limitations.
