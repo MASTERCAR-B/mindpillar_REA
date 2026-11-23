@@ -1,0 +1,5 @@
+# Core REST client (mp.MindPillarClient) uses Python 3.10+ stdlib only.
+# Install these optional dependencies for real-time WebSocket streaming and the local HTTP/WS server:
+websockets>=12.0
+fastapi>=0.110.0
+uvicorn>=0.29.0
